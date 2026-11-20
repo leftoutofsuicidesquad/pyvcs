@@ -1,19 +1,41 @@
 
 import hashlib
 import zlib
+
 from pathlib import Path
 
 
-def hash_object(data: bytes, obj_type: str, write: bool = True) -> str:
-    """Calculate SHA-1 hash of a Git object and optionally store it."""
+def get_git_dir(repo: str | Path = ".") -> Path:
+    """Return the Git directory of a repository."""
 
-    header = f"{obj_type} {len(data)}".encode()
-    full_data = header + b"\x00" + data
+    repo = Path(repo).resolve()
+    git_dir = repo if repo.name == ".git" else repo / ".git"
+
+    if not git_dir.is_dir():
+        raise FileNotFoundError(f"Git repository not found: {repo}")
+
+    return git_dir
+
+
+def hash_object(
+    data: bytes,
+    obj_type: str,
+    write: bool = True,
+    repo: str | Path = ".",
+) -> str:
+    """Calculate the SHA-1 hash of a Git object and optionally store it."""
+
+    if obj_type not in {"blob", "tree", "commit", "tag"}:
+        raise ValueError(f"Invalid Git object type: {obj_type}")
+
+    header = f"{obj_type} {len(data)}".encode("ascii")
+    full_data = header + b"\0" + data
 
     sha1 = hashlib.sha1(full_data).hexdigest()
 
     if write:
-        object_path = Path(".git") / "objects" / sha1[:2] / sha1[2:]
+        git_dir = get_git_dir(repo)
+        object_path = git_dir / "objects" / sha1[:2] / sha1[2:]
 
         if not object_path.exists():
             object_path.parent.mkdir(parents=True, exist_ok=True)
@@ -22,20 +44,27 @@ def hash_object(data: bytes, obj_type: str, write: bool = True) -> str:
     return sha1
 
 
-def read_object(sha1: str):
-    """Read and decompress a Git object from the object store."""
+def read_object(
+    sha1: str,
+    repo: str | Path = ".",
+) -> tuple[str, bytes]:
+    """Read and decompress a Git object."""
 
-    object_path = Path(".git") / "objects" / sha1[:2] / sha1[2:]
+    if len(sha1) != 40:
+        raise ValueError("Invalid SHA-1 length")
 
-    compressed_data = object_path.read_bytes()
-    full_data = zlib.decompress(compressed_data)
+    git_dir = get_git_dir(repo)
+    object_path = git_dir / "objects" / sha1[:2] / sha1[2:]
 
-    header, data = full_data.split(b"\x00", 1)
+    full_data = zlib.decompress(object_path.read_bytes())
 
-    obj_type, size = header.decode().split(" ", 1)
+    try:
+        header, data = full_data.split(b"\0", 1)
+        obj_type, size = header.decode("ascii").split(" ", 1)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("Invalid Git object") from exc
 
     if len(data) != int(size):
         raise ValueError("Corrupted Git object: size mismatch")
 
     return obj_type, data
-

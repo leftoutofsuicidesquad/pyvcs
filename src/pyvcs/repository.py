@@ -1,13 +1,12 @@
 
-import os
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 
-from pygit.objects import hash_object
-from pygit.index import read_index
+from pyvcs.index import read_index
+from pyvcs.objects import hash_object
 
 
-def init(repo):
+def init(repo: str | Path = ".") -> None:
     """Initialize an empty Git repository."""
 
     repo = Path(repo).resolve()
@@ -18,16 +17,22 @@ def init(repo):
 
     (git_dir / "HEAD").write_text(
         "ref: refs/heads/master\n",
-        encoding="ascii"
+        encoding="ascii",
     )
 
     print(f"Initialized empty repository: {repo}")
 
 
-def get_local_master_hash(repo="."):
-    """Return the current master commit hash, or None."""
+def get_local_master_hash(repo: str | Path = ".") -> str | None:
+    """Return the current master commit hash."""
 
-    master_path = Path(repo) / ".git" / "refs" / "heads" / "master"
+    master_path = (
+        Path(repo).resolve()
+        / ".git"
+        / "refs"
+        / "heads"
+        / "master"
+    )
 
     if not master_path.exists():
         return None
@@ -35,32 +40,66 @@ def get_local_master_hash(repo="."):
     return master_path.read_text(encoding="ascii").strip() or None
 
 
-def write_tree(repo="."):
+def write_tree(repo: str | Path = ".") -> str:
     """Create a tree object from the current index."""
 
+    repo = Path(repo).resolve()
     entries = read_index(repo)
-    tree_entries = []
 
-    for entry in sorted(entries, key=lambda e: e.path.encode()):
-        if "/" in entry.path:
-            raise NotImplementedError(
-                "Nested directories are not supported yet."
+    root = {}
+
+    for entry in entries:
+        parts = Path(entry.path).parts
+
+        if not parts or entry.path.startswith("/"):
+            raise ValueError(f"Invalid index path: {entry.path}")
+
+        current = root
+
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+
+        current[parts[-1]] = entry
+
+    def create_tree(directory: dict) -> str:
+        tree_entries = []
+
+        for name, value in directory.items():
+            name_bytes = name.encode("utf-8")
+
+            if isinstance(value, dict):
+                child_sha = create_tree(value)
+                mode = b"40000"
+                sort_name = name_bytes + b"/"
+            else:
+                child_sha = value.sha1.hex()
+                mode = f"{value.mode:o}".encode("ascii")
+                sort_name = name_bytes
+
+            if len(child_sha) != 40:
+                raise ValueError(f"Invalid object hash: {child_sha}")
+
+            tree_entries.append(
+                (sort_name, mode + b" " + name_bytes + b"\0"
+                 + bytes.fromhex(child_sha))
             )
 
-        if len(entry.sha1) != 20:
-            raise ValueError(f"Invalid SHA-1 for {entry.path}")
+        tree_entries.sort(key=lambda item: item[0])
 
-        mode = f"{entry.mode:o}".encode()
-        path = entry.path.encode()
-
-        tree_entries.append(
-            mode + b" " + path + b"\0" + entry.sha1
+        tree_data = b"".join(
+            data for _, data in tree_entries
         )
 
-    return hash_object(b"".join(tree_entries), "tree")
+        return hash_object(tree_data, "tree", repo=repo)
+
+    return create_tree(root)
 
 
-def commit(message, author, repo="."):
+def commit(
+    message: str,
+    author: str,
+    repo: str | Path = ".",
+) -> str:
     """Create a commit from the current index."""
 
     repo = Path(repo).resolve()
@@ -70,7 +109,7 @@ def commit(message, author, repo="."):
     parent = get_local_master_hash(repo)
 
     now = datetime.now().astimezone()
-    author_time = f"{int(now.timestamp())} {now.strftime('%z')}"
+    timestamp = f"{int(now.timestamp())} {now.strftime('%z')}"
 
     lines = [f"tree {tree}"]
 
@@ -78,19 +117,18 @@ def commit(message, author, repo="."):
         lines.append(f"parent {parent}")
 
     lines.extend([
-        f"author {author} {author_time}",
-        f"committer {author} {author_time}",
+        f"author {author} {timestamp}",
+        f"committer {author} {timestamp}",
         "",
         message,
         "",
     ])
 
     data = "\n".join(lines).encode("utf-8")
-    sha1 = hash_object(data, "commit")
+    sha1 = hash_object(data, "commit", repo=repo)
 
     master_path = git_dir / "refs" / "heads" / "master"
     master_path.parent.mkdir(parents=True, exist_ok=True)
-
     master_path.write_text(sha1 + "\n", encoding="ascii")
 
     print(f"Committed to master: {sha1[:7]}")
