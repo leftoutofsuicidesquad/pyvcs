@@ -3,8 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pyvcs.index import read_index
-from pyvcs.objects import hash_object
-
+from pyvcs.objects import hash_object, get_git_dir
 
 def init(repo: str | Path = ".") -> None:
     """Initialize an empty Git repository."""
@@ -22,48 +21,33 @@ def init(repo: str | Path = ".") -> None:
 
     print(f"Initialized empty repository: {repo}")
 
-
-
 def get_current_branch(repo="."):
-    """Return the name of the currently checked-out branch."""
+    """Return the currently checked-out branch."""
 
-    repo = Path(repo).resolve()
-    head_path = repo / ".git" / "HEAD"
-
-    if not head_path.is_file():
-        raise FileNotFoundError(f"Git HEAD not found: {head_path}")
+    git_dir = get_git_dir(repo)
+    head_path = git_dir / "HEAD"
 
     head = head_path.read_text(encoding="ascii").strip()
-
     prefix = "ref: refs/heads/"
 
     if not head.startswith(prefix):
         raise ValueError("Detached HEAD is not supported yet")
 
-    branch = head[len(prefix):]
-
-    if not branch or ".." in branch or branch.startswith("/"):
-        raise ValueError("Invalid branch reference")
-
-    return branch
+    return head[len(prefix):]
 
 
 def get_local_master_hash(repo="."):
     """Return the current branch commit hash, or None."""
 
-    repo = Path(repo).resolve()
+    git_dir = get_git_dir(repo)
     branch = get_current_branch(repo)
 
-    ref_path = repo / ".git" / "refs" / "heads" / branch
+    ref_path = git_dir / "refs" / "heads" / branch
 
     if not ref_path.is_file():
         return None
 
-    sha1 = ref_path.read_text(encoding="ascii").strip()
-
-    return sha1 or None
-
-
+    return ref_path.read_text(encoding="ascii").strip() or None
 
 def write_tree(repo: str | Path = ".") -> str:
     """Create a tree object from the current index."""
@@ -152,10 +136,10 @@ def commit(
     data = "\n".join(lines).encode("utf-8")
     sha1 = hash_object(data, "commit", repo=repo)
 
-    master_path = git_dir / "refs" / "heads" / "master"
-    master_path.parent.mkdir(parents=True, exist_ok=True)
-    master_path.write_text(sha1 + "\n", encoding="ascii")
+    branch = get_current_branch(repo)
+    ref_path = git_dir / "refs" / "heads" / branch
+    ref_path.parent.mkdir(parents=True, exist_ok=True)
+    ref_path.write_text(sha1 + "\n", encoding="ascii")
 
-    print(f"Committed to master: {sha1[:7]}")
-
+    print(f"Committed to {branch}: {sha1[:7]}")
     return sha1

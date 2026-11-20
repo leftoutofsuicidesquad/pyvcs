@@ -13,7 +13,6 @@ import requests
 from pyvcs.objects import read_object
 from pyvcs.repository import get_local_master_hash
 
-
 class ObjectType(IntEnum):
     COMMIT = 1
     TREE = 2
@@ -31,7 +30,6 @@ OBJECT_TYPES = {
 HASH_LENGTH = 40
 PACK_VERSION = 2
 HTTP_TIMEOUT = (10, 60)
-BRANCH = "master"
 
 
 def extract_lines(data: bytes) -> list[bytes]:
@@ -111,7 +109,10 @@ def http_request(url, username=None, password=None, data=None):
             "Accept": "application/x-git-receive-pack-result",
         })
     else:
-        headers["Accept"] = "application/x-git-receive-pack-advertisement"
+        if "service=git-receive-pack" in url:
+            headers["Accept"] = "application/x-git-receive-pack-advertisement"
+        else:
+            headers["Accept"] = "application/x-git-upload-pack-advertisement"
 
     auth = (username, password) if username is not None else None
 
@@ -128,18 +129,18 @@ def http_request(url, username=None, password=None, data=None):
     return response.content
 
 
-def get_remote_master_hash(git_url, username=None, password=None):
+def get_remote_branch_hash(git_url, username=None, password=None, branch="master"):
     """Return the remote master SHA-1 or None."""
 
-    url = f"{git_url.rstrip('/')}/info/refs?service=git-receive-pack"
+    url = f"{git_url.rstrip('/')}/info/refs?service=git-upload-pack"
     response = http_request(url, username, password)
     lines = extract_lines(response)
 
     if len(lines) < 2:
         raise ValueError("Invalid receive-pack advertisement")
 
-    if lines[0] != b"# service=git-receive-pack\n":
-        raise ValueError("Invalid Git service announcement")
+    if lines[0] != b"# service=git-upload-pack\n":
+    	raise ValueError("Invalid Git service announcement")
 
     if lines[1] != b"":
         raise ValueError("Missing service announcement flush packet")
@@ -156,7 +157,7 @@ def get_remote_master_hash(git_url, username=None, password=None):
 
         sha1, ref = parts
 
-        if ref == f"refs/heads/{BRANCH}".encode("ascii"):
+        if ref == f"refs/heads/{branch}".encode("ascii"):
             if sha1 == b"0" * HASH_LENGTH:
                 return None
 
@@ -333,31 +334,31 @@ def create_pack(objects, repo="."):
     return contents + checksum
 
 
+
 def push(git_url, username=None, password=None, repo="."):
-    """Push the local master branch to a remote repository."""
+    """Push the current local branch to a remote repository."""
 
     repo = Path(repo).resolve()
-
+    branch = get_current_branch(repo)
     local_sha1 = get_local_master_hash(repo)
 
     if local_sha1 is None:
-        raise ValueError("Cannot push: no local commits")
+        raise ValueError(f"Cannot push: branch '{branch}' has no commits")
 
-    # Send all locally reachable objects. The server deduplicates objects
-    # that it already has, so no remote object traversal is necessary.
     objects = find_commit_objects(local_sha1, repo)
 
-    remote_sha1 = get_remote_master_hash(
+    remote_sha1 = get_remote_branch_hash(
         git_url,
         username,
         password,
+        branch=branch,
     )
 
     old_sha1 = remote_sha1 or ("0" * HASH_LENGTH)
+    ref = f"refs/heads/{branch}"
 
     command = (
-        f"{old_sha1} {local_sha1} refs/heads/{BRANCH}"
-        "\0report-status"
+        f"{old_sha1} {local_sha1} {ref}\0report-status"
     ).encode("ascii")
 
     request_data = (
@@ -377,9 +378,7 @@ def push(git_url, username=None, password=None, repo="."):
     lines = extract_lines(response)
 
     if not lines or lines[0] != b"unpack ok\n":
-        raise RuntimeError(
-            f"Remote rejected pack: {lines[:1]}"
-        )
+        raise RuntimeError(f"Remote rejected pack: {lines[:1]}")
 
     status = lines[1:]
 
@@ -390,10 +389,11 @@ def push(git_url, username=None, password=None, repo="."):
                 + line.decode("utf-8", errors="replace")
             )
 
-    expected = f"ok refs/heads/{BRANCH}".encode("ascii")
+    expected = f"ok {ref}".encode("ascii")
 
     if not any(line.rstrip(b"\n") == expected for line in status):
-        raise RuntimeError("Remote did not confirm master update")
+        raise RuntimeError("Remote did not confirm branch update")
 
-    print(f"Pushed to remote: {local_sha1[:7]}")
+    print(f"Pushed {branch}: {local_sha1[:7]}")
     return local_sha1
+

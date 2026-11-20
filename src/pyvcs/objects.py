@@ -4,7 +4,6 @@ import zlib
 
 from pathlib import Path
 
-
 def get_git_dir(repo: str | Path = ".") -> Path:
     """Return the Git directory of a repository."""
 
@@ -15,7 +14,6 @@ def get_git_dir(repo: str | Path = ".") -> Path:
         raise FileNotFoundError(f"Git repository not found: {repo}")
 
     return git_dir
-
 
 def hash_object(
     data: bytes,
