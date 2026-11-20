@@ -2,19 +2,18 @@
 """Remote communication and Git smart HTTP transport."""
 
 import hashlib
-import stat
 import struct
 import zlib
 
 from enum import IntEnum
+from pathlib import Path
 
 import requests
 
-from pygit.objects import read_object, read_tree
-from pygit.repository import get_local_master_hash
+from pyvcs.objects import read_object
+from pyvcs.repository import get_local_master_hash
 
 
-# Git pack object type identifiers.
 class ObjectType(IntEnum):
     COMMIT = 1
     TREE = 2
@@ -32,6 +31,7 @@ OBJECT_TYPES = {
 HASH_LENGTH = 40
 PACK_VERSION = 2
 HTTP_TIMEOUT = (10, 60)
+BRANCH = "master"
 
 
 def extract_lines(data: bytes) -> list[bytes]:
@@ -56,7 +56,7 @@ def extract_lines(data: bytes) -> list[bytes]:
             continue
 
         if length < 4:
-            raise ValueError(f"Invalid pkt-line length: {length}")
+            raise ValueError(f"Unsupported pkt-line marker: {length}")
 
         end = offset + length - 4
 
@@ -69,8 +69,8 @@ def extract_lines(data: bytes) -> list[bytes]:
     return lines
 
 
-def build_lines_data(lines: list[bytes]) -> bytes:
-    """Encode payloads as Git pkt-lines followed by flush packet."""
+def build_lines_data(lines: list[bytes | str]) -> bytes:
+    """Encode payloads as Git pkt-lines followed by a flush packet."""
 
     result = []
 
@@ -93,43 +93,45 @@ def build_lines_data(lines: list[bytes]) -> bytes:
         result.append(line)
 
     result.append(b"0000")
-
     return b"".join(result)
 
 
-def http_request(url, username, password, data=None):
-    """Perform authenticated Git HTTP request."""
+def http_request(url, username=None, password=None, data=None):
+    """Perform an authenticated Git smart HTTP request."""
+
+    is_post = data is not None
 
     headers = {
-        "User-Agent": "pygit/0.1",
+        "User-Agent": "pyvcs/0.1",
     }
 
-    if data is None:
-        headers["Git-Protocol"] = "version=0"
-
+    if is_post:
+        headers.update({
+            "Content-Type": "application/x-git-receive-pack-request",
+            "Accept": "application/x-git-receive-pack-result",
+        })
     else:
-        headers["Content-Type"] = "application/x-git-receive-pack-request"
-        headers["Accept"] = "application/x-git-receive-pack-result"
+        headers["Accept"] = "application/x-git-receive-pack-advertisement"
+
+    auth = (username, password) if username is not None else None
 
     response = requests.request(
-        method="POST" if data is not None else "GET",
+        method="POST" if is_post else "GET",
         url=url,
-        auth=(username, password),
+        auth=auth,
         headers=headers,
         data=data,
         timeout=HTTP_TIMEOUT,
     )
 
     response.raise_for_status()
-
     return response.content
 
 
-def get_remote_master_hash(git_url, username, password):
+def get_remote_master_hash(git_url, username=None, password=None):
     """Return the remote master SHA-1 or None."""
 
     url = f"{git_url.rstrip('/')}/info/refs?service=git-receive-pack"
-
     response = http_request(url, username, password)
     lines = extract_lines(response)
 
@@ -154,7 +156,7 @@ def get_remote_master_hash(git_url, username, password):
 
         sha1, ref = parts
 
-        if ref == b"refs/heads/master":
+        if ref == f"refs/heads/{BRANCH}".encode("ascii"):
             if sha1 == b"0" * HASH_LENGTH:
                 return None
 
@@ -166,7 +168,47 @@ def get_remote_master_hash(git_url, username, password):
     return None
 
 
-def find_tree_objects(tree_sha1):
+def read_tree_entries(tree_sha1, repo="."):
+    """Parse a Git tree object into (mode, name, SHA-1) entries."""
+
+    obj_type, data = read_object(tree_sha1, repo=repo)
+
+    if obj_type != "tree":
+        raise ValueError(f"Expected tree object: {tree_sha1}")
+
+    entries = []
+    offset = 0
+
+    while offset < len(data):
+        space = data.find(b" ", offset)
+        if space == -1:
+            raise ValueError("Invalid tree entry: missing mode separator")
+
+        null = data.find(b"\0", space + 1)
+        if null == -1:
+            raise ValueError("Invalid tree entry: missing name terminator")
+
+        sha_start = null + 1
+        sha_end = sha_start + 20
+
+        if sha_end > len(data):
+            raise ValueError("Invalid tree entry: incomplete object ID")
+
+        try:
+            mode = int(data[offset:space], 8)
+        except ValueError as exc:
+            raise ValueError("Invalid tree entry mode") from exc
+
+        name = data[space + 1:null]
+        sha1 = data[sha_start:sha_end].hex()
+
+        entries.append((mode, name, sha1))
+        offset = sha_end
+
+    return entries
+
+
+def find_tree_objects(tree_sha1, repo="."):
     """Find all objects referenced by a tree recursively."""
 
     objects = set()
@@ -180,22 +222,23 @@ def find_tree_objects(tree_sha1):
 
         objects.add(current)
 
-        obj_type, _ = read_object(current)
-
-        if obj_type != "tree":
-            raise ValueError(f"Expected tree object: {current}")
-
-        for mode, path, sha1 in read_tree(sha1=current):
-            if stat.S_ISDIR(mode):
+        for mode, _name, sha1 in read_tree_entries(current, repo):
+            # Directories are tree objects.
+            if mode == 0o40000:
                 pending.append(sha1)
+
+            # Gitlinks (submodules) refer to commits in another repository.
+            elif mode == 0o160000:
+                continue
+
             else:
                 objects.add(sha1)
 
     return objects
 
 
-def find_commit_objects(commit_sha1):
-    """Find commit and all recursively referenced objects."""
+def find_commit_objects(commit_sha1, repo="."):
+    """Find a commit and all recursively referenced local objects."""
 
     objects = set()
     pending = [commit_sha1]
@@ -206,12 +249,12 @@ def find_commit_objects(commit_sha1):
         if current in objects:
             continue
 
-        objects.add(current)
-
-        obj_type, data = read_object(current)
+        obj_type, data = read_object(current, repo=repo)
 
         if obj_type != "commit":
             raise ValueError(f"Expected commit object: {current}")
+
+        objects.add(current)
 
         lines = data.decode("utf-8").splitlines()
 
@@ -223,8 +266,8 @@ def find_commit_objects(commit_sha1):
         if tree_line is None:
             raise ValueError(f"Commit has no tree: {current}")
 
-        tree = tree_line[5:45]
-        objects.update(find_tree_objects(tree))
+        tree_sha1 = tree_line[5:45]
+        objects.update(find_tree_objects(tree_sha1, repo))
 
         for line in lines:
             if line.startswith("parent "):
@@ -233,26 +276,10 @@ def find_commit_objects(commit_sha1):
     return objects
 
 
-def find_missing_objects(local_sha1, remote_sha1):
-    """Find objects available locally but missing remotely."""
+def encode_pack_object(object_sha1, repo="."):
+    """Encode one Git object for a pack file."""
 
-    if local_sha1 is None:
-        return set()
-
-    local_objects = find_commit_objects(local_sha1)
-
-    if remote_sha1 is None:
-        return local_objects
-
-    remote_objects = find_commit_objects(remote_sha1)
-
-    return local_objects - remote_objects
-
-
-def encode_pack_object(object_sha1):
-    """Encode one Git object for pack file."""
-
-    obj_type, data = read_object(object_sha1)
+    obj_type, data = read_object(object_sha1, repo=repo)
 
     try:
         type_num = OBJECT_TYPES[obj_type]
@@ -261,24 +288,30 @@ def encode_pack_object(object_sha1):
 
     size = len(data)
 
-    # First byte: type (4 bits) + first 4 size bits.
-    byte = (type_num << 4) | (size & 0x0F)
+    first_byte = (int(type_num) << 4) | (size & 0x0F)
     size >>= 4
 
     header = bytearray()
 
+    if size:
+        first_byte |= 0x80
+
+    header.append(first_byte)
+
     while size:
-        header.append(byte | 0x80)
         byte = size & 0x7F
         size >>= 7
 
-    header.append(byte)
+        if size:
+            byte |= 0x80
+
+        header.append(byte)
 
     return bytes(header) + zlib.compress(data)
 
 
-def create_pack(objects):
-    """Create complete Git pack file."""
+def create_pack(objects, repo="."):
+    """Create a complete, non-delta Git pack file."""
 
     objects = sorted(objects)
 
@@ -290,7 +323,7 @@ def create_pack(objects):
     )
 
     body = b"".join(
-        encode_pack_object(object_sha1)
+        encode_pack_object(object_sha1, repo)
         for object_sha1 in objects
     )
 
@@ -300,28 +333,37 @@ def create_pack(objects):
     return contents + checksum
 
 
-def push(git_url, username, password):
-    """Push the local master branch to remote repository."""
+def push(git_url, username=None, password=None, repo="."):
+    """Push the local master branch to a remote repository."""
 
-    remote_sha1 = get_remote_master_hash(
-        git_url, username, password
-    )
+    repo = Path(repo).resolve()
 
-    local_sha1 = get_local_master_hash()
+    local_sha1 = get_local_master_hash(repo)
 
     if local_sha1 is None:
         raise ValueError("Cannot push: no local commits")
 
-    missing = find_missing_objects(local_sha1, remote_sha1)
+    # Send all locally reachable objects. The server deduplicates objects
+    # that it already has, so no remote object traversal is necessary.
+    objects = find_commit_objects(local_sha1, repo)
+
+    remote_sha1 = get_remote_master_hash(
+        git_url,
+        username,
+        password,
+    )
 
     old_sha1 = remote_sha1 or ("0" * HASH_LENGTH)
 
     command = (
-        f"{old_sha1} {local_sha1} refs/heads/master"
+        f"{old_sha1} {local_sha1} refs/heads/{BRANCH}"
         "\0report-status"
     ).encode("ascii")
 
-    request_data = build_lines_data([command]) + create_pack(missing)
+    request_data = (
+        build_lines_data([command])
+        + create_pack(objects, repo)
+    )
 
     url = f"{git_url.rstrip('/')}/git-receive-pack"
 
@@ -344,15 +386,14 @@ def push(git_url, username, password):
     for line in status:
         if line.startswith(b"ng "):
             raise RuntimeError(
-                f"Remote rejected ref update: {line.decode(errors='replace')}"
+                "Remote rejected ref update: "
+                + line.decode("utf-8", errors="replace")
             )
 
-    if not any(
-        line.startswith(b"ok refs/heads/master")
-        for line in status
-    ):
+    expected = f"ok refs/heads/{BRANCH}".encode("ascii")
+
+    if not any(line.rstrip(b"\n") == expected for line in status):
         raise RuntimeError("Remote did not confirm master update")
 
     print(f"Pushed to remote: {local_sha1[:7]}")
-
     return local_sha1
