@@ -23,21 +23,46 @@ def init(repo: str | Path = ".") -> None:
     print(f"Initialized empty repository: {repo}")
 
 
-def get_local_master_hash(repo: str | Path = ".") -> str | None:
-    """Return the current master commit hash."""
 
-    master_path = (
-        Path(repo).resolve()
-        / ".git"
-        / "refs"
-        / "heads"
-        / "master"
-    )
+def get_current_branch(repo="."):
+    """Return the name of the currently checked-out branch."""
 
-    if not master_path.exists():
+    repo = Path(repo).resolve()
+    head_path = repo / ".git" / "HEAD"
+
+    if not head_path.is_file():
+        raise FileNotFoundError(f"Git HEAD not found: {head_path}")
+
+    head = head_path.read_text(encoding="ascii").strip()
+
+    prefix = "ref: refs/heads/"
+
+    if not head.startswith(prefix):
+        raise ValueError("Detached HEAD is not supported yet")
+
+    branch = head[len(prefix):]
+
+    if not branch or ".." in branch or branch.startswith("/"):
+        raise ValueError("Invalid branch reference")
+
+    return branch
+
+
+def get_local_master_hash(repo="."):
+    """Return the current branch commit hash, or None."""
+
+    repo = Path(repo).resolve()
+    branch = get_current_branch(repo)
+
+    ref_path = repo / ".git" / "refs" / "heads" / branch
+
+    if not ref_path.is_file():
         return None
 
-    return master_path.read_text(encoding="ascii").strip() or None
+    sha1 = ref_path.read_text(encoding="ascii").strip()
+
+    return sha1 or None
+
 
 
 def write_tree(repo: str | Path = ".") -> str:
